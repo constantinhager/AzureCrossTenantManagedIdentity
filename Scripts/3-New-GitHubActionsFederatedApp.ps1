@@ -29,9 +29,11 @@
          (AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID).
 
     The federated credential's subject is bound to a branch
-    ('repo:<org>/<repo>:ref:refs/heads/<branch>'), matching the 'main'
-    branch trigger used by 'deploy-function.yml'. This intentionally does
-    NOT use a GitHub Environment.
+    ('repo:<org>@<ownerId>/<repo>@<repoId>:ref:refs/heads/<branch>' for
+    repositories using GitHub's immutable OIDC subject format, or the
+    classic 'repo:<org>/<repo>:ref:refs/heads/<branch>' otherwise),
+    matching the 'main' branch trigger used by 'deploy-function.yml'. This
+    intentionally does NOT use a GitHub Environment.
 
 .PARAMETER AppDisplayName
     Display name of the App Registration to create or reuse. Default:
@@ -59,6 +61,19 @@
 
 .PARAMETER GitHubBranch
     Name of the branch the federated credential trusts. Default: 'main'.
+
+.PARAMETER GitHubOwnerId
+    Numeric ID of the GitHub organization/user (owner_id claim). For
+    repositories created after 2026-07-15, or that opted in to GitHub's
+    immutable OIDC subject claims, the 'sub' claim GitHub presents is
+    'repo:<org>@<ownerId>/<repo>@<repoId>:ref:refs/heads/<branch>' instead
+    of the classic 'repo:<org>/<repo>:ref:...' format. If not supplied,
+    the script resolves it automatically via the public GitHub REST API.
+
+.PARAMETER GitHubRepositoryId
+    Numeric ID of the GitHub repository (repository_id claim). See
+    -GitHubOwnerId. If not supplied, the script resolves it automatically
+    via the public GitHub REST API.
 
 .PARAMETER RoleDefinitionName
     Azure RBAC role assigned to the Service Principal on
@@ -128,6 +143,16 @@ param(
     [Parameter()]
     [ValidateNotNullOrEmpty()]
     [string]
+    $GitHubOwnerId,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]
+    $GitHubRepositoryId,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]
     $RoleDefinitionName = 'Website Contributor'
 )
 
@@ -168,12 +193,24 @@ Write-Host "  Service Principal Object ID: $($sp.Id)"
 #endregion
 
 #region 3) Create the Federated Identity Credential trusting GitHub's OIDC issuer
+# GitHub uses an immutable 'repo:<org>@<ownerId>/<repo>@<repoId>:ref:...' subject
+# for repositories created/renamed/transferred after 2026-07-15 (or opted in earlier) -
+# resolve the numeric IDs via the public GitHub REST API unless explicitly supplied.
+if (-not $GitHubOwnerId -or -not $GitHubRepositoryId) {
+    Write-Host "Resolving GitHub owner/repository IDs for '$GitHubOrganization/$GitHubRepository'..." -ForegroundColor Cyan
+    $repoInfo = Invoke-RestMethod -Uri "https://api.github.com/repos/$GitHubOrganization/$GitHubRepository" -Headers @{ 'User-Agent' = 'AzureCrossTenantManagedIdentity' } -ErrorAction Stop
+    if (-not $GitHubOwnerId) { $GitHubOwnerId = $repoInfo.owner.id }
+    if (-not $GitHubRepositoryId) { $GitHubRepositoryId = $repoInfo.id }
+}
+Write-Host "  Owner ID:      $GitHubOwnerId"
+Write-Host "  Repository ID: $GitHubRepositoryId"
+
 $ficParams = @{
     Name        = "github-actions-$GitHubBranch"
     Issuer      = 'https://token.actions.githubusercontent.com'
-    Subject     = "repo:$($GitHubOrganization)/$($GitHubRepository):ref:refs/heads/$($GitHubBranch)"
+    Subject     = "repo:$($GitHubOrganization)@$($GitHubOwnerId)/$($GitHubRepository)@$($GitHubRepositoryId):ref:refs/heads/$($GitHubBranch)"
     Audiences   = @('api://AzureADTokenExchange')
-    Description = "Trusts GitHub Actions in '$GitHubOrganization/$GitHubRepository' on branch '$GitHubBranch'."
+    Description = "Trusts GitHub Actions in '$GitHubOrganization/$GitHubRepository' on branch '$GitHubBranch' (immutable subject)."
 }
 
 $existingFic = Get-MgApplicationFederatedIdentityCredential -ApplicationId $app.Id |
@@ -182,8 +219,11 @@ Where-Object { $_.Name -eq $ficParams.Name }
 if (-not $existingFic) {
     New-MgApplicationFederatedIdentityCredential -ApplicationId $app.Id -BodyParameter $ficParams | Out-Null
     Write-Host 'Federated Identity Credential created.' -ForegroundColor Green
+} elseif ($existingFic.Subject -ne $ficParams.Subject) {
+    Update-MgApplicationFederatedIdentityCredential -ApplicationId $app.Id -FederatedIdentityCredentialId $existingFic.Id -BodyParameter $ficParams | Out-Null
+    Write-Host "Federated Identity Credential subject updated (was '$($existingFic.Subject)', now '$($ficParams.Subject)')." -ForegroundColor Green
 } else {
-    Write-Host 'Federated Identity Credential already exists, skipping.' -ForegroundColor Yellow
+    Write-Host 'Federated Identity Credential already exists and matches, skipping.' -ForegroundColor Yellow
 }
 #endregion
 
@@ -211,6 +251,6 @@ Write-Host "  AZURE_CLIENT_ID:       $($app.AppId)"
 Write-Host "  AZURE_TENANT_ID:       $HomeTenantId"
 Write-Host "  AZURE_SUBSCRIPTION_ID: $SubscriptionId"
 Write-Host ''
-Write-Host "Federated credential subject: repo:$GitHubOrganization/$GitHubRepository:ref:refs/heads/$GitHubBranch"
+Write-Host "Federated credential subject: $($ficParams.Subject)"
 Write-Host 'This only works for workflow runs triggered on that exact branch (push or workflow_dispatch against it).'
 #endregion

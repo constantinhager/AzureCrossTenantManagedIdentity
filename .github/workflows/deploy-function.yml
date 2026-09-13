@@ -20,7 +20,10 @@ concurrency:
 jobs:
     build-and-deploy:
         name: Build and deploy
-        runs-on: ubuntu-latest
+        # psf-build.ps1 bootstraps PSFramework.NuGet via a script that assumes a
+        # Windows-style ";"-separated PSModulePath with a "Documents" folder entry,
+        # so Save-PSFModule never becomes available on Linux runners.
+        runs-on: windows-latest
         steps:
             - name: Checkout
               uses: actions/checkout@v4
