@@ -1,0 +1,5 @@
+gh secret set AZURE_CLIENT_ID --repo constantinhager/AzureCrossTenantManagedIdentity
+gh secret set AZURE_TENANT_ID --repo constantinhager/AzureCrossTenantManagedIdentity
+gh secret set AZURE_SUBSCRIPTION_ID --repo constantinhager/AzureCrossTenantManagedIdentity
+gh variable set AZURE_FUNCTIONAPP_RG --body "crosstenant-rg" --repo constantinhager/AzureCrossTenantManagedIdentity
+gh variable set AZURE_FUNCTIONAPP_NAME --body "chcrosstenantfuncapp001" --repo constantinhager/AzureCrossTenantManagedIdentity
