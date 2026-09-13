@@ -1,11 +1,12 @@
-#Requires -Modules Az.Accounts, Az.Resources, Az.Storage, Az.Functions, Az.ManagedServiceIdentity
+#Requires -Modules Az.Accounts, Az.Resources, Az.Storage, Az.Functions, Az.ManagedServiceIdentity, Az.OperationalInsights, Az.ApplicationInsights
 <#
 .SYNOPSIS
     Provisions the complete infrastructure required for the "Managed
     Identity as Federated Identity Credential" scenario in the home tenant:
-    Resource Group, Storage Account, User-Assigned Managed Identity, and
-    the Azure Function App (PowerShell runtime, Flex Consumption plan),
-    including assigning the UAMI to it.
+    Resource Group, Storage Account, User-Assigned Managed Identity, a
+    workspace-based Application Insights component, and the Azure Function
+    App (PowerShell runtime, Flex Consumption plan), including assigning
+    the UAMI to it and wiring up Application Insights.
 
 .DESCRIPTION
     This script is step 0 - BEFORE creating the App Registration
@@ -20,8 +21,10 @@
 
     Prerequisite: An active Az sign-in in the home tenant (Connect-AzAccount)
     with sufficient rights to create/modify Resource Groups, Storage
-    Accounts, Managed Identities, and Function Apps, and to register the
-    Microsoft.Storage, Microsoft.Web, and Microsoft.ManagedIdentity resource
+    Accounts, Managed Identities, Function Apps, Log Analytics Workspaces,
+    and Application Insights components, and to register the
+    Microsoft.Storage, Microsoft.Web, Microsoft.ManagedIdentity,
+    Microsoft.OperationalInsights, and Microsoft.Insights resource
     providers (the script registers them automatically if needed).
 
 .PARAMETER ResourceGroupName
@@ -44,6 +47,14 @@
     Name of the User-Assigned Managed Identity that is created and
     assigned to the Function App. Its Object (Principal) ID is then needed
     as the subject for the Federated Identity Credential in script 1.
+
+.PARAMETER LogAnalyticsWorkspaceName
+    Name of the Log Analytics Workspace backing the workspace-based
+    Application Insights component. Default: 'chcrosstenantlaw001'.
+
+.PARAMETER ApplicationInsightsName
+    Name of the Application Insights component connected to the Function
+    App. Default: 'chcrosstenantappi001'.
 
 .PARAMETER PowerShellVersion
     PowerShell runtime version of the Function App. Default: '7.6'. The
@@ -110,12 +121,22 @@ param(
     $UserAssignedIdentityName = 'chcrosstenantuami001',
 
     [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]
+    $LogAnalyticsWorkspaceName = 'chcrosstenantlaw001',
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]
+    $ApplicationInsightsName = 'chcrosstenantappi001',
+
+    [Parameter()]
     [string]
     $PowerShellVersion = '7.4'
 )
 
 #region 0) Required resource providers
-$requiredProviderNamespaces = 'Microsoft.Storage', 'Microsoft.Web', 'Microsoft.ManagedIdentity'
+$requiredProviderNamespaces = 'Microsoft.Storage', 'Microsoft.Web', 'Microsoft.ManagedIdentity', 'Microsoft.OperationalInsights', 'Microsoft.Insights'
 foreach ($providerNamespace in $requiredProviderNamespaces) {
     $provider = Get-AzResourceProvider -ProviderNamespace $providerNamespace -ErrorAction Stop -WarningAction SilentlyContinue | Select-Object -First 1
     if ($provider.RegistrationState -ne 'Registered') {
@@ -191,7 +212,48 @@ if (-not $storage) {
 if (-not $storage.Id) { throw "Failed to create or find Storage Account '$StorageAccountName'." }
 #endregion
 
-#region 4) Function App with PowerShell runtime + assigned UAMI (Flex Consumption plan)
+#region 4) Log Analytics Workspace + workspace-based Application Insights
+$Parameters = @{
+    ResourceGroupName = $ResourceGroupName
+    Name              = $LogAnalyticsWorkspaceName
+    ErrorAction       = 'SilentlyContinue'
+}
+$law = Get-AzOperationalInsightsWorkspace @Parameters
+if (-not $law) {
+    Write-Host "Creating Log Analytics Workspace '$LogAnalyticsWorkspaceName'..." -ForegroundColor Cyan
+    $Parameters = @{
+        ResourceGroupName = $ResourceGroupName
+        Name              = $LogAnalyticsWorkspaceName
+        Location          = $Location
+        ErrorAction       = 'Stop'
+        WarningAction     = 'SilentlyContinue'
+    }
+    $law = New-AzOperationalInsightsWorkspace @Parameters
+}
+if (-not $law.ResourceId) { throw "Failed to create or find Log Analytics Workspace '$LogAnalyticsWorkspaceName'." }
+
+$Parameters = @{
+    ResourceGroupName = $ResourceGroupName
+    Name              = $ApplicationInsightsName
+    ErrorAction       = 'SilentlyContinue'
+}
+$appInsights = Get-AzApplicationInsights @Parameters
+if (-not $appInsights) {
+    Write-Host "Creating Application Insights component '$ApplicationInsightsName'..." -ForegroundColor Cyan
+    $Parameters = @{
+        ResourceGroupName   = $ResourceGroupName
+        Name                = $ApplicationInsightsName
+        Location            = $Location
+        WorkspaceResourceId = $law.ResourceId
+        ErrorAction         = 'Stop'
+        WarningAction       = 'SilentlyContinue'
+    }
+    $appInsights = New-AzApplicationInsights @Parameters
+}
+if (-not $appInsights.Id) { throw "Failed to create or find Application Insights component '$ApplicationInsightsName'." }
+#endregion
+
+#region 5) Function App with PowerShell runtime + assigned UAMI (Flex Consumption plan)
 $Parameters = @{
     ResourceGroupName = $ResourceGroupName
     Name              = $FunctionAppName
@@ -227,20 +289,25 @@ if (-not $functionApp) {
     }
 } else {
     Write-Host 'Function App already exists, assigning the Managed Identity (if not already done)...' -ForegroundColor Yellow
-    $Parameters = @{
-        ResourceGroupName    = $ResourceGroupName
-        Name                 = $FunctionAppName
-        UserAssignedIdentity = @($uami.Id)
-        Force                = $true
-        ErrorAction          = 'Stop'
-        WarningAction        = 'SilentlyContinue'
+
+    # Update-AzFunctionApp explicitly refuses to update Flex Consumption apps ("does not yet
+    # support updating Flex Consumption function apps"), so patch the identity directly via ARM.
+    $identityBody = @{
+        identity = @{
+            type                   = 'UserAssigned'
+            userAssignedIdentities = @{ $uami.Id = @{} }
+        }
+    } | ConvertTo-Json -Depth 10
+
+    $identityResponse = Invoke-AzRestMethod -Path "$($functionApp.Id)?api-version=2023-12-01" -Method PATCH -Payload $identityBody
+    if ($identityResponse.StatusCode -notin 200, 201, 202) {
+        throw "Failed to assign the Managed Identity to Function App '$FunctionAppName' (HTTP $($identityResponse.StatusCode)): $($identityResponse.Content)"
     }
-    Update-AzFunctionApp @Parameters
 }
 if (-not $functionApp.Id) { throw "Failed to create or find Function App '$FunctionAppName'." }
 #endregion
 
-#region 5) Prepare App Settings for the token exchange
+#region 6) Prepare App Settings for the token exchange and Application Insights
 # CROSSTENANT_APP_CLIENT_ID only comes from script 1 (AppId of the App Registration)
 # and is deliberately left out here - after script 1, just add it:
 #
@@ -248,7 +315,8 @@ if (-not $functionApp.Id) { throw "Failed to create or find Function App '$Funct
 #       -AppSetting @{ CROSSTENANT_APP_CLIENT_ID = '<AppId from script 1>' }
 
 Update-AzFunctionAppSetting -ResourceGroupName $ResourceGroupName -Name $FunctionAppName -AppSetting @{
-    MANAGED_IDENTITY_CLIENT_ID = $uami.ClientId
+    MANAGED_IDENTITY_CLIENT_ID            = $uami.ClientId
+    APPLICATIONINSIGHTS_CONNECTION_STRING = $appInsights.ConnectionString
 } -ErrorAction Stop -WarningAction SilentlyContinue | Out-Null
 #endregion
 
@@ -256,6 +324,8 @@ Write-Host ''
 Write-Host '=== Done ===' -ForegroundColor Green
 Write-Host "Resource Group:            $ResourceGroupName"
 Write-Host "Function App:              $FunctionAppName"
+Write-Host "Application Insights:      $ApplicationInsightsName"
+Write-Host "Log Analytics Workspace:   $LogAnalyticsWorkspaceName"
 Write-Host "Managed Identity (Name):   $UserAssignedIdentityName"
 Write-Host "Managed Identity (Object): $($uami.PrincipalId)"
 Write-Host "Managed Identity (Client): $($uami.ClientId)"
