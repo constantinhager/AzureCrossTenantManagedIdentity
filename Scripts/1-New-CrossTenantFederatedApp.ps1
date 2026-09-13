@@ -107,18 +107,41 @@ Connect-MgGraph -TenantId $HomeTenantId -Scopes @(
 #region 1) Create or reuse the App Registration (multi-tenant)
 $existingApp = Get-MgApplication -Filter "displayName eq '$AppDisplayName'"
 
+# The admin-consent flow (region 4) redirects back to a Reply URL after consent -
+# without at least one registered, it fails with AADSTS500113. This app never
+# actually receives an interactive sign-in (only client-credentials/JWT-bearer is
+# used at runtime), so a plain, always-reachable HTTPS placeholder is sufficient.
+# NOTE: 'https://login.microsoftonline.com/common/oauth2/nativeclient' looks like
+# the obvious choice, but it is only special-cased under the 'Public client/native'
+# platform - registered as a Web Reply URL (as required here) it causes Entra ID's
+# post-consent redirect to fail with "This is not the right page".
+$placeholderRedirectUri = 'https://portal.azure.com'
+
 if (-not $existingApp) {
     Write-Host "Creating new multi-tenant App Registration '$AppDisplayName'..." -ForegroundColor Cyan
 
     $Parameters = @{
         DisplayName    = $AppDisplayName
         SignInAudience = 'AzureADMultipleOrgs'
-        Web            = @{ RedirectUris = @() }
+        Web            = @{ RedirectUris = @($placeholderRedirectUri) }
     }
     $app = New-MgApplication @Parameters
 } else {
     Write-Host "App Registration '$AppDisplayName' already exists, reusing it." -ForegroundColor Yellow
-    $app = $existingApp
+
+    # Get-MgApplication -Filter returns a reduced property set - 'Web' is often $null
+    # there even when it IS set, so re-fetch by ID with an explicit -Property to get
+    # the authoritative current value before deciding whether an update is needed.
+    $app = Get-MgApplication -ApplicationId $existingApp.Id -Property 'id,appId,web'
+    $currentRedirectUris = @($app.Web.RedirectUris)
+    Write-Host "  Current Reply URL(s): $(if ($currentRedirectUris) { $currentRedirectUris -join ', ' } else { '<none>' })"
+
+    if ($currentRedirectUris -notcontains $placeholderRedirectUri) {
+        Write-Host 'Reply URL missing or outdated (would cause AADSTS500113 / "wrong page" on admin consent), updating...' -ForegroundColor Cyan
+        Update-MgApplication -ApplicationId $app.Id -Web @{ RedirectUris = @($placeholderRedirectUri) } -ErrorAction Stop
+        $app = Get-MgApplication -ApplicationId $app.Id -Property 'id,appId,web'
+        Write-Host "  Reply URL(s) after update: $($app.Web.RedirectUris -join ', ')" -ForegroundColor Green
+    }
 }
 
 Write-Host "  AppId (Client ID): $($app.AppId)"
@@ -175,7 +198,7 @@ if (-not $existingFic) {
 #endregion
 
 #region 4) Print the admin consent URL for the target tenant
-$consentUrl = "https://login.microsoftonline.com/organizations/adminconsent?client_id=$($app.AppId)"
+$consentUrl = "https://login.microsoftonline.com/organizations/adminconsent?client_id=$($app.AppId)&redirect_uri=$([uri]::EscapeDataString($placeholderRedirectUri))"
 
 Write-Host ''
 Write-Host '=== Done ===' -ForegroundColor Green
